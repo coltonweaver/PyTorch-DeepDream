@@ -1,64 +1,70 @@
 import torch
-import argparse
 from torchvision import models, transforms
+
+import argparse
 import numpy as np
 import matplotlib.pyplot as plt
 from PIL import Image, ImageFilter, ImageChops
 
-# Determine if cuda is available on system
-cuda_available = torch.cuda.is_available
+# Using the VGG19 model trained on ImageNet, need only the layers
+vgg = models.vgg19(pretrained=True).features
 
-# Using the VGG16 model trained on ImageNet
-vgg = models.vgg16(pretrained=True)
+# Freeze the parameters because no need to update model
+for param in vgg.parameters():
+    param.requires_grad_(False)
 
-# Move the model to GPU memory if available
-if cuda_available:
-    vgg = vgg.cuda()
+# Move VGG model to GPU if available for faster processing.
+device = torch.device("cuda" if torch.cuda.is_available else "cpu")
+vgg.to(device)
 
-# Extract the exact layers to access them individually
-layer_list = list(vgg.features.children())
+def transform_image(image, max_size=400, shape=None):
+    '''
+        Take an image and transform it to put it through algorithm.
+    '''
 
-# Normalize the input to the VGG16 network
-normalize = transforms.Normalize(
-    mean=[0.485, 0.456, 0.406],
-    std=[0.229, 0.224, 0.225]
-)
+    # Now process the input image
+    image_trans = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(
+            (0.485, 0.456, 0.406),
+            (0.229, 0.224, 0.225)
+        )
+    ])
 
-# All PyTorch Models require resizing to 224x224, converted to tensor, and normalized
-process_image = transforms.Compose([
-    transforms.Resize((224,224)),
-    transforms.ToTensor(),
-    normalize
-])
+    # Remove hidden alpha channel, keeping just RGB and unsqueeze to flatten it.
+    image = image_trans(image)[:3,:,:].unsqueeze(0).to(device)
+    return image
 
-# Function takes image tensor, removes normalization values and returns it
-def deprocess(image_tensor):
-    std_tensor = torch.Tensor([0.229, 0.224, 0.225])
-    mean_tensor = torch.Tensor([0.485, 0.456, 0.406])
+def im_convert(tensor):
+    '''
+        Takes in a tensor representing an image, and converts it to a proper Image
+    '''
+    image = tensor.to("cpu").clone().detach()
+    image = image.numpy().squeeze()
+    image = image.transpose(1,2, 0)
+    image = image * np.array((0.229, 0.224, 0.225)) + np.array((0.485, 0.456, 0.406))
+    image = image.clip(0,1)
 
-    if cuda_available:
-        std_tensor, mean_tensor = std_tensor.cuda(), mean_tensor.cuda()
+    return Image.fromarray(np.uint8(image * 255))
 
-    return image_tensor * std_tensor + mean_tensor
-
-# Function puts given image through model to specified layer for given iterations
-def helper(raw_image, layer, iterations, lr):
-    input_tensor = process_image(raw_image).unsqueeze(0)
-
-    if cuda_available:
-        input_tensor = input_tensor.cuda()
-
-    # Zero out all gradients of the model parameters
-    vgg.zero_grad()
-
+def image_forward(input_tensor, layer, iterations, lr):
+    '''
+        Runs the given image through the model to the given layer for the given number of iterations 
+    '''
     # Begin iterations with given image
     for _ in range(iterations):
         temp_tensor = input_tensor
-        temp_tensor.requires_grad_()
+        temp_tensor.requires_grad_(True)
 
         # Input image through vgg model to specified layer
-        for j in range(layer):
-            temp_tensor = layer_list[j](temp_tensor)
+        i = 0
+        for _, layer in vgg._modules.items():
+            if i == iterations:
+                break
+            temp_tensor = layer(temp_tensor)
+            i += 1
+
         
         # Now track the loss and grad at the layer to apply to input image
         loss = temp_tensor.norm()
@@ -66,20 +72,15 @@ def helper(raw_image, layer, iterations, lr):
 
         # Add the learned gradient data to the input image data
         input_tensor.data = input_tensor.data + lr * input_tensor.grad.data
+    
+    return im_convert(input_tensor)
 
-    # Take processed tensor and return to image type
-    input_tensor = input_tensor.data.squeeze()
-    input_tensor.transpose_(0,1)
-    input_tensor.transpose_(1,2)
-    input_tensor = deprocess(input_tensor)
-
-    return Image.fromarray(np.uint8(input_tensor.cpu() * 255))
-
-# Handles processing the image through the model
-def deep_dream(raw_image, layer, iterations, lr, octave_scale, num_octaves):
-
+def deep_dream(image, layer, iterations, lr, octave_scale, num_octaves):
+    '''
+        Takes the image, requested layer, iterations, learning rate, and scale and performs the deep dream transformation
+    '''
     if num_octaves > 0:
-        temp_image = raw_image
+        temp_image = image
 
         # Downscale the image by octave_scale
         if (temp_image.size[0] / octave_scale < 1) or (temp_image.size[1] / octave_scale < 1):
@@ -91,27 +92,27 @@ def deep_dream(raw_image, layer, iterations, lr, octave_scale, num_octaves):
         temp_image = temp_image.resize(size, Image.ANTIALIAS)
         temp_image = deep_dream(temp_image, layer, iterations, lr, octave_scale, num_octaves - 1)
 
-        temp_image = temp_image.resize(raw_image.size, Image.ANTIALIAS)
+        temp_image = temp_image.resize(image.size, Image.ANTIALIAS)
 
         # Blend the processed image into the original image
-        raw_image = ImageChops.blend(raw_image, temp_image, 0.85)
+        image = ImageChops.blend(image, temp_image, 0.6)
     
     # This is where the deep dream logic is applied to this version of the image
-    result = helper(raw_image, layer, iterations, lr)
-    result = result.resize(raw_image.size)
+    result = image_forward(transform_image(image), layer, iterations, lr)
+    result = result.resize(image.size)
     return result
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Takes a given image and applies DeepDream algorithm to it.")
     parser.add_argument('-f', dest='file', action='store', required=True, default=None, help='Path to input image.')
-    parser.add_argument('-l', dest='layer', action='store', default=16, help='Desired network layer to push image through to. (Default = 16)')
+    parser.add_argument('-l', dest='layer', action='store', default=10, help='Desired network layer to push image through to. (Default = 10)')
     parser.add_argument('-i', dest='iter', action='store', default=11, help='Desired iterations to apply to image. (Default = 11)')
-    parser.add_argument('-lr', dest='lr', action='store', default=0.0012, help='Desired learning rate to use in algorithm. (Default = 0.0012)')
+    parser.add_argument('-lr', dest='lr', action='store', default=0.01, help='Desired learning rate to use in algorithm. (Default = 0.01)')
 
     args = parser.parse_args()
 
-    raw_image = Image.open(args.file)
-    result = deep_dream(raw_image, args.layer, args.iter, args.lr, 2, 20)
+    input_image = Image.open(args.file)
+    result = deep_dream(input_image, args.layer, args.iter, args.lr, 2, 20)
 
     plt.imshow(result)
     plt.show()
